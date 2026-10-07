@@ -97,8 +97,9 @@ jobs:
         run: |
           image="${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
           # Same environment as docker-compose (Eureka points to discovery-server), without registering,
-          # because the smoke test runs the image in isolation.
-          docker run -d --name smoke -p 8080:8080             -e ASPNETCORE_ENVIRONMENT=Docker             -e Eureka__Client__ShouldRegisterWithEureka=false             "$image"
+          # because the smoke test runs the image in isolation. The instance IP is set explicitly because
+          # the compose hostname (invoicing-service) does not resolve outside the compose network.
+          docker run -d --name smoke -p 8080:8080             -e ASPNETCORE_ENVIRONMENT=Docker             -e Eureka__Client__ShouldRegisterWithEureka=false             -e Eureka__Instance__IPAddress=127.0.0.1             "$image"
           for attempt in $(seq 1 30); do
             if curl -fsS "http://localhost:8080${SMOKE_HEALTH_PATH}"; then
               echo
