@@ -1,4 +1,4 @@
-@US01
+@US11
 Feature: Smart invoice upload
   As a MYPE business owner
   I want to register my invoice in the MYPE Web
