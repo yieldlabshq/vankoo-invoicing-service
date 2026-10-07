@@ -1,0 +1,213 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+# Cancels superseded runs on pull requests, but never interrupts a push to develop or main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/yieldlabshq/vankoo-invoicing-service
+  SERVICE_NAME: vankoo-invoicing-service
+  DOCKERFILE: LiquiLabs.Vankoo.Invoicing/Dockerfile
+  # Liveness does not depend on MongoDB or object storage, so it can be checked without infrastructure.
+  SMOKE_HEALTH_PATH: /health/live
+  HEALTH_PATH: /health/ready
+
+jobs:
+  # 7.1 Continuous Integration: build and run the full test suite on every push and pull request.
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore LiquiLabs.Vankoo.Invoicing.sln
+
+      - name: Build
+        run: dotnet build LiquiLabs.Vankoo.Invoicing.sln --configuration Release --no-restore
+
+      - name: Run unit, integration and BDD tests
+        run: >
+          dotnet test LiquiLabs.Vankoo.Invoicing.sln --configuration Release --no-build
+          --logger "trx;LogFileName=test-results.trx" --results-directory test-results
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: test-results/
+          if-no-files-found: ignore
+
+  # 7.2 Continuous Delivery: package the tested code as an image, validate it and publish it.
+  publish-image:
+    name: Build, Validate & Publish Image
+    needs: build-and-test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          image="${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
+          docker run -d --name smoke -p 8080:8080 "$image"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://localhost:8080${SMOKE_HEALTH_PATH}"; then
+              echo
+              echo "Container is alive after ${attempt} attempt(s)."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::The container did not start."
+          docker logs smoke
+          exit 1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+  # 7.3 Continuous Deployment: every push to main that passes the previous jobs goes to production.
+  deploy-production:
+    name: Deploy to Production
+    needs: publish-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    env:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_DNS_LABEL: ${{ vars.AZURE_DNS_LABEL }}
+      PRODUCTION_ENV: ${{ secrets.PRODUCTION_ENV }}
+    steps:
+      - name: Check deployment configuration
+        id: config
+        run: |
+          if [ -z "$AZURE_CREDENTIALS" ] || [ -z "$AZURE_RESOURCE_GROUP" ] || [ -z "$AZURE_DNS_LABEL" ]; then
+            echo "::notice title=Deployment skipped::Configure AZURE_CREDENTIALS, PRODUCTION_ENV, AZURE_RESOURCE_GROUP and AZURE_DNS_LABEL in the production environment to enable it."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Azure
+        if: steps.config.outputs.enabled == 'true'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy container to Azure Container Instances
+        id: deploy
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          az container create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$SERVICE_NAME" \
+            --image "${IMAGE_NAME}:sha-${GITHUB_SHA::7}" \
+            --os-type Linux --cpu 1 --memory 1.5 \
+            --ports 8080 \
+            --dns-name-label "$AZURE_DNS_LABEL" \
+            --secure-environment-variables $PRODUCTION_ENV
+          fqdn=$(az container show --resource-group "$AZURE_RESOURCE_GROUP" --name "$SERVICE_NAME" --query ipAddress.fqdn -o tsv)
+          echo "url=http://${fqdn}:8080" >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployment health
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          for attempt in $(seq 1 40); do
+            if curl -fsS "${{ steps.deploy.outputs.url }}${HEALTH_PATH}"; then
+              echo
+              echo "Production deployment is ready."
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::error::The production deployment did not become ready."
+          exit 1
+
+      - name: Log in to GitHub Container Registry
+        if: steps.config.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mark image as the current production release
+        if: success() && steps.config.outputs.enabled == 'true'
+        run: docker buildx imagetools create -t "${IMAGE_NAME}:production" "${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
+
+      - name: Roll back to the previous production release
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          echo "::warning::Rolling back to the previous production image."
+          az container create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$SERVICE_NAME" \
+            --image "${IMAGE_NAME}:production" \
+            --os-type Linux --cpu 1 --memory 1.5 \
+            --ports 8080 \
+            --dns-name-label "$AZURE_DNS_LABEL" \
+            --secure-environment-variables $PRODUCTION_ENV
