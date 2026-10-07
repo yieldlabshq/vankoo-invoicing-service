@@ -60,7 +60,7 @@ jobs:
   publish-image:
     name: Build, Validate & Publish Image
     needs: build-and-test
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -96,7 +96,9 @@ jobs:
       - name: Smoke test the image
         run: |
           image="${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
-          docker run -d --name smoke -p 8080:8080 "$image"
+          # Same environment as docker-compose (Eureka points to discovery-server), without registering,
+          # because the smoke test runs the image in isolation.
+          docker run -d --name smoke -p 8080:8080             -e ASPNETCORE_ENVIRONMENT=Docker             -e Eureka__Client__ShouldRegisterWithEureka=false             "$image"
           for attempt in $(seq 1 30); do
             if curl -fsS "http://localhost:8080${SMOKE_HEALTH_PATH}"; then
               echo
